@@ -7,6 +7,10 @@ from typing import Optional, List, Dict
 import uuid
 import json
 from pydantic import BaseModel
+import datetime
+
+# Import the new QueryBuild module
+from query_build import generate_code
 
 app = FastAPI()
 
@@ -28,7 +32,7 @@ class DocumentStore:
         self.load_documents()
         
     def load_documents(self):
-        if os.path.exists(DOCUMENT_STORE_FILE):
+        if (os.path.exists(DOCUMENT_STORE_FILE)):
             try:
                 with open(DOCUMENT_STORE_FILE, 'r') as f:
                     data = json.load(f)
@@ -367,4 +371,66 @@ async def get_section_summary(
     
     return response
 
-import datetime
+@app.post("/query_to_code")
+async def query_to_code(
+    prompt: str = Form(...),
+    doc_id: Optional[str] = Form(None),
+    section: Optional[str] = Form(None),
+    max_length: int = Form(500),
+    language: Optional[str] = Form(None)
+):
+    """Process a query through QueryNest, then generate code from the summary with QueryBuild."""
+    document = document_store.get_document(doc_id)
+    
+    if not document:
+        raise HTTPException(400, "No document available")
+    
+    # First phase: Generate summary with QueryNest
+    problem_num = extract_problem_statement_num_from_query(prompt)
+    if problem_num and not section:
+        section = f"Problem Statement {problem_num}"
+    
+    query_summary_response = None
+    
+    # Try section-based query first if section is specified
+    if section and "sections" in document:
+        matched_section = None
+        for sec in document["sections"]:
+            sec_title = sec["title"].lower()
+            if section.lower() in sec_title or (
+                "section_num" in sec and 
+                sec["section_num"] == problem_num
+            ):
+                matched_section = sec
+                break
+                
+        if matched_section:
+            focused_summary = summarize_document(matched_section["content"], max_length=max_length)
+            query_summary_response = focused_summary
+    
+    # If no section match or no section specified, use the general approach
+    if not query_summary_response:
+        embeddings = np.array(document["embeddings"])
+        metadata = document.get("metadata", [{}] * len(document["chunks"]))
+        
+        # Use the query_section function to get a specific answer
+        result = query_section(
+            document["chunks"],
+            embeddings,
+            metadata,
+            prompt,
+            section
+        )
+        
+        query_summary_response = result
+    
+    # Second phase: Generate code with QueryBuild based on the summary
+    code_generation_prompt = f"Based on this requirement: {prompt}\n\nGenerate code to implement the following solution: {query_summary_response}"
+    
+    code_result = generate_code(code_generation_prompt, language)
+    
+    # Return both the summary and generated code
+    return {
+        "query_result": query_summary_response,
+        "code_result": code_result
+    }
